@@ -1,5 +1,5 @@
 [package]
-name = "img_process_server"
+name = "picto-crab"
 version = "0.1.0"
 authors = ["RedstoneMedia <34373974+RedstoneMedia@users.noreply.github.com>"]
 edition = "2021"

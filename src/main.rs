@@ -269,13 +269,13 @@ fn main() {
         thread_channels.push((to_thread_send, from_thread_recv));
     }
 
-    println!("[ImgProcessServer] Waiting for connection");
+    println!("[PictoCrab] Waiting for connection");
     for stream in listener.incoming() {
         let Ok(stream) = stream else {continue};
         let process_id = stream.client_process_id().unwrap();
-        println!("[ImgProcessServer] Connected to process {:?}", process_id);
+        println!("[PictoCrab] Connected to process {:?}", process_id);
         if let Err(e) = read_loop(stream, cached_images.clone(), &thread_channels) {
-            println!("[ImgProcessServer] Error with client {:?}: {:?}", process_id, e)
+            println!("[PictoCrab] Error with client {:?}: {:?}", process_id, e)
         }
     }
 }
