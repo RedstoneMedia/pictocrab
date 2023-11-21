@@ -13,6 +13,6 @@ PictoCrab is an image processing and caching server that uses pipes to load and 
 PictoCrab requires Windows to run, as it uses Windows named pipes to communicate.
 
 ## Usage
-To use PictoCrab, you can need to send commands to the server through pipes. \
+To use PictoCrab, you need to send commands to the server through pipes. \
 For an example please look at:
 [img_process_server_connect.py](img_process_server_connect.py)
