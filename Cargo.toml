@@ -1,0 +1,20 @@
+[package]
+name = "img_process_server"
+version = "0.1.0"
+authors = ["RedstoneMedia <34373974+RedstoneMedia@users.noreply.github.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+log = []
+
+[dependencies]
+image = "0.23.14"
+sysinfo = "0.29.10"
+once_cell = "1.18.0"
+interprocess = "1.2.1"
+anyhow = "1.0.75"
+fnv = "1.0.7"
+reqwest = {version = "0.11.22", features = ["blocking"]}
+mimalloc = { version = "0.1.39", default-features = false }
