@@ -10,7 +10,7 @@ PictoCrab is an image processing and caching server that uses pipes to load and 
 - PictoCrab can load images from disk 💾 with a specific resolution or from a HTTP server 🌈
 
 ## Requirements
-PictoCrab requires Windows to run, as it uses Windows named pipes to communicate. \
+PictoCrab requires Windows to run, as it uses Windows named pipes to communicate.
 
 ## Usage
 To use PictoCrab, you can need to send commands to the server through pipes. \
