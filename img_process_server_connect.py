@@ -72,10 +72,10 @@ def write_msg(handle, data):
 
 class ImageProcessServerConnect:
 
-    def __init__(self, cache_dir: str, threaded_reads: bool, working_dir = "./"):
-        subprocess.Popen(["img_process_server.exe"])
+    def __init__(self, cache_dir: str, threaded_reads: bool, working_dir = "./", fill_strategy = "reflect"):
+        subprocess.Popen(["picto-crab.exe"])
         self.handle = connect_to_pipe(SERVER_PIPE_NAME)
-        self.send_command("setup", [cache_dir, working_dir, str(threaded_reads).lower()])
+        self.send_command("setup", [cache_dir, working_dir, str(threaded_reads).lower(), fill_strategy])
         self.current_command = None
 
     def send_command(self, command_type : str, args : list):

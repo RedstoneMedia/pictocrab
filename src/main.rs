@@ -1,11 +1,13 @@
 use std::io::{Read, Write};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::ops::Deref;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock, mpsc};
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use interprocess::os::windows::named_pipe::{PipeListener, DuplexBytePipeStream, PipeListenerOptions, PipeMode};
-use image::{ImageFormat, GenericImageView, EncodableLayout};
-use sysinfo::{System, SystemExt, RefreshKind};
+use image::{ImageFormat, GenericImageView, EncodableLayout, DynamicImage, GenericImage};
+use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 use once_cell::sync::OnceCell;
 use mimalloc::MiMalloc;
 
@@ -15,10 +17,11 @@ static GLOBAL: MiMalloc = MiMalloc;
 const GETS_THREAD_COUNT: usize = 12;
 const BUFFER_SIZE: usize = 4096;
 const PIPE_NAME: &str = "img_process_server";
-const MIN_AVAILABLE_MEMORY : u64 = 2;
+const MIN_AVAILABLE_MEMORY : u64 = 6;
 
 static CACHE_DIR : OnceCell<String> = OnceCell::new();
 static THREADED_READS: OnceCell<bool> = OnceCell::new();
+static FILL_STRATEGY: OnceCell<FillStrategy> = OnceCell::new();
 
 enum CacheType {
     OnDisk(u32),
@@ -47,13 +50,15 @@ fn get_disk_cache_path(cache_id: &u32) -> anyhow::Result<String> {
 fn cache_img(path : String, img_bytes : Arc<Vec<u8>>, cached_images : &CachedImageShared) -> anyhow::Result<()> {
     #[cfg(feature = "log")]
     let instant = std::time::Instant::now();
-    let sys = System::new_with_specifics(RefreshKind::with_memory(Default::default()));
+    let sys = System::new_with_specifics(RefreshKind::nothing()
+        .with_memory(MemoryRefreshKind::everything())
+    );
     let available_memory = sys.available_memory();
     let mut unlocked_cache = cached_images.write().expect("Cannot write to cache");
 
     if (available_memory / 1000000000) < MIN_AVAILABLE_MEMORY {
         let cache_id = unlocked_cache.0.len() as u32;
-        std::fs::write(get_disk_cache_path(&cache_id)?, img_bytes.as_bytes())?;
+        std::fs::write(get_disk_cache_path(&cache_id)?, img_bytes.as_bytes()).context("Could not write to disk cache")?;
         unlocked_cache.0.insert(path, CacheType::OnDisk(cache_id));
     } else {
         unlocked_cache.0.insert(path, CacheType::InMemory(img_bytes));
@@ -79,6 +84,122 @@ fn get_from_cache<'a>(path : &str, cached_images : &CachedImageShared) -> anyhow
     });
     i
 }
+
+
+#[derive(Debug, Clone)]
+enum FillStrategy {
+    Constant(u8),
+    Reflect,
+    Nearest
+}
+
+// Implement parse from string
+impl FromStr for FillStrategy {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut split = s.split(" ");
+        let name = split.next().context("No fill strategy")?;
+        match name {
+            "constant" => {
+                let value : u8 = split.next().context("Expected value")?.parse().context("Expected u8")?;
+                Ok(FillStrategy::Constant(value))
+            },
+            "reflect" => Ok(FillStrategy::Reflect),
+            "nearest" => Ok(FillStrategy::Nearest),
+            _ => Err(anyhow!("Unknown fill strategy"))
+        }
+
+    }
+}
+
+
+fn resize_and_pad(img: DynamicImage, width: u32, height: u32, fill_strategy: &FillStrategy) -> DynamicImage {
+    let resized = img.thumbnail(width, height);
+    let mut padded = DynamicImage::new_rgba8(width, height);
+    let vertical_pad = resized.height() < height;
+
+    let mid_y = (height - resized.height()) / 2;
+    let mid_x = (width - resized.width()) / 2;
+
+    match fill_strategy {
+        FillStrategy::Constant(value) => {
+            let p = padded.as_mut_rgba8().expect("Could not convert to RGBA8");
+            p.as_mut().fill(*value)
+        }
+        FillStrategy::Reflect => {
+            if vertical_pad {
+                // Upper part
+                for y in 0..mid_y {
+                    let source_y = mid_y - y;
+                    for x in 0..width {
+                        let pixel = resized.get_pixel(x, source_y);
+                        padded.put_pixel(x, y, pixel);
+                    }
+                }
+                // Lower part
+                let lower_start = mid_y + resized.height();
+                for y in lower_start..height {
+                    let source_y = (lower_start - y) + resized.height() - 1;
+                    for x in 0..width {
+                        let pixel = resized.get_pixel(x, source_y);
+                        padded.put_pixel(x, y, pixel);
+                    }
+                }
+            } else {
+                // Left part
+                for x in 0..mid_x {
+                    let source_x = mid_x - x;
+                    for y in 0..height {
+                        let pixel = resized.get_pixel(source_x, y);
+                        padded.put_pixel(x, y, pixel);
+                    }
+                }
+                // Right part
+                let right_start = mid_x + resized.width();
+                for x in right_start..width {
+                    let source_x = (right_start - x) + resized.width() - 1;
+                    for y in 0..height {
+                        let pixel = resized.get_pixel(source_x, y);
+                        padded.put_pixel(x, y, pixel);
+                    }
+                }
+            }
+        },
+        FillStrategy::Nearest => {
+            if vertical_pad {
+                let top_slice = resized.view(0, 0, width, 1);
+                let bottom_slice = resized.view(0, resized.height() - 1, width, 1);
+                for y in 0..mid_y {
+                    padded.copy_from(top_slice.deref(), 0, y).expect("Cannot copy slice");
+                }
+                let lower_start = mid_y + resized.height();
+                for y in lower_start..height {
+                    padded.copy_from(bottom_slice.deref(), 0, y).expect("Cannot copy slice");
+                }
+            } else {
+                let left_slice = resized.view(0, 0, 1, height);
+                let right_slice = resized.view(resized.width() - 1, 0, 1, height);
+                for x in 0..mid_x {
+                    padded.copy_from(left_slice.deref(), x, 0).expect("Cannot copy slice");
+                }
+                let right_start = mid_x + resized.width();
+                for x in right_start..width {
+                    padded.copy_from(right_slice.deref(), x, 0).expect("Cannot copy slice");
+                }
+            }
+        }
+    }
+
+    if vertical_pad {
+        padded.copy_from(&resized, 0, mid_y).expect("Cannot copy to padded");
+    } else {
+        padded.copy_from(&resized, mid_x, 0).expect("Cannot copy to padded");
+    }
+
+    padded
+}
+
 
 
 fn get_image<S: Write>(stream : &mut S, cached_images : &CachedImageShared, path : &str, width : u32, height : u32) -> anyhow::Result<()> {
@@ -112,10 +233,10 @@ fn get_image<S: Write>(stream : &mut S, cached_images : &CachedImageShared, path
             // Just get the write guard first, which will prevent any other threads from reading images at the same time
             // This can improve performance, if reading off hard drives, because the seek head then doesn't have to move as much
             let _guard = cached_images.write().expect("Could not get write lock");
-            std::fs::read(path)?
+            std::fs::read(path).context("Could not read image file")?
             // guard gets dropped here
         } else {
-            std::fs::read(path)?
+            std::fs::read(path).context("Could not read image file")?
         }
     };
     #[cfg(feature = "log")]
@@ -125,10 +246,11 @@ fn get_image<S: Write>(stream : &mut S, cached_images : &CachedImageShared, path
 
     let mut img = image::load_from_memory(&raw_img_bytes)?;
     if img.width() != width || img.height() != height {
-        img = img.thumbnail_exact(width, height);
+        img = resize_and_pad(img, width, height, FILL_STRATEGY.get().ok_or(anyhow!("Not setup"))?);
     }
-    let mut bmp_img_bytes = Vec::new();
-    img.write_to(&mut bmp_img_bytes, ImageFormat::Bmp)?;
+    let mut bmp_img = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut bmp_img, ImageFormat::Bmp).context("could not convert image to bytes")?;
+    let bmp_img_bytes = bmp_img.into_inner();
     #[cfg(feature = "log")]
     println!("d: {}ns", instant.elapsed().as_nanos());
     let bmp_img_bytes_rc = Arc::new(bmp_img_bytes);
@@ -164,7 +286,12 @@ fn gets_images(stream: &mut DuplexBytePipeStream, cached_images: &CachedImageSha
         return Ok(());
     }
 
-    let mut thread_chunks : Vec<_> = paths.chunks(paths.len() / GETS_THREAD_COUNT).map(|v| Vec::from(v)).collect();
+    let chunk_size = paths.len() / GETS_THREAD_COUNT;
+    let mut thread_chunks : Vec<_> = if chunk_size == 0 {
+        vec![paths.iter().map(|p| *p).collect()]
+    } else {
+        paths.chunks(chunk_size).map(|v| Vec::from(v)).collect()
+    };
     while thread_chunks.len() > GETS_THREAD_COUNT {
         let mut remainder = thread_chunks.pop().unwrap();
         thread_chunks.last_mut().unwrap().append(&mut remainder);
@@ -185,11 +312,12 @@ fn gets_images(stream: &mut DuplexBytePipeStream, cached_images: &CachedImageSha
 }
 
 
-fn setup(disk_cache_dir: &str, working_dir: &str, threaded_reads: bool) -> anyhow::Result<()> {
+fn setup(disk_cache_dir: &str, working_dir: &str, threaded_reads: bool, fill_strategy: FillStrategy) -> anyhow::Result<()> {
     std::env::set_current_dir(working_dir)?;
     if CACHE_DIR.get().is_some() {return Ok(());}
     CACHE_DIR.set(disk_cache_dir.to_string()).expect("Can only setup once!");
     THREADED_READS.set(threaded_reads).unwrap();
+    FILL_STRATEGY.set(fill_strategy).unwrap();
     Ok(())
 }
 
@@ -212,9 +340,9 @@ fn clear_cache(cached_images : &CachedImageShared) -> anyhow::Result<()> {
 fn process_command(args : Vec<&str>, stream : &mut DuplexBytePipeStream, cached_images : &CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
     match args[0] {
         "clear_cache" => clear_cache(cached_images)?,
-        "setup" => setup(args[1], args[2], args[3] == "true")?,
+        "setup" => setup(args[1], args[2], args[3] == "true", args[4].parse()?)?,
         "gets" => gets_images(stream, cached_images, thread_channels, args[1].parse::<u32>().unwrap(), args[2].parse::<u32>().unwrap(), &args[3..])?,
-        "get" => {get_image(stream, cached_images, args[1],  args[2].parse::<u32>().unwrap(), args[3].parse::<u32>().unwrap())?},
+        "get" => {get_image(stream, cached_images, args[1], args[2].parse::<u32>().unwrap(), args[3].parse::<u32>().unwrap())?},
         _ => {println!("No such command : {}", args[0])}
     }
     Ok(())

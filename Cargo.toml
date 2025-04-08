@@ -1,6 +1,6 @@
 [package]
 name = "picto-crab"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["RedstoneMedia <34373974+RedstoneMedia@users.noreply.github.com>"]
 edition = "2021"
 
@@ -10,11 +10,10 @@ edition = "2021"
 log = []
 
 [dependencies]
-image = "0.23.14"
-sysinfo = "0.29.10"
-once_cell = "1.18.0"
-interprocess = "1.2.1"
-anyhow = "1.0.75"
-fnv = "1.0.7"
-reqwest = {version = "0.11.22", features = ["blocking"]}
-mimalloc = { version = "0.1.39", default-features = false }
+image = "0.25"
+sysinfo = "0.34"
+once_cell = "1.21"
+interprocess = "1"
+anyhow = "1.0"
+reqwest = {version = "0.12", features = ["blocking"]}
+mimalloc = { version = "0.1", default-features = false }
