@@ -5,8 +5,9 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, mpsc};
 use anyhow::{anyhow, Context};
+use fast_image_resize as fr;
 use interprocess::os::windows::named_pipe::{PipeListener, DuplexBytePipeStream, PipeListenerOptions, PipeMode};
-use image::{ImageFormat, GenericImageView, EncodableLayout, DynamicImage, GenericImage};
+use image::{ImageFormat, GenericImageView, EncodableLayout, DynamicImage, GenericImage, GrayImage};
 use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 use once_cell::sync::OnceCell;
 use mimalloc::MiMalloc;
@@ -22,6 +23,8 @@ const MIN_AVAILABLE_MEMORY : u64 = 6;
 static CACHE_DIR : OnceCell<String> = OnceCell::new();
 static THREADED_READS: OnceCell<bool> = OnceCell::new();
 static FILL_STRATEGY: OnceCell<FillStrategy> = OnceCell::new();
+static FILTER_TYPE: OnceCell<MyFilterType> = OnceCell::new();
+static GRAYSCALE: OnceCell<bool> = OnceCell::new();
 
 enum CacheType {
     OnDisk(u32),
@@ -86,7 +89,7 @@ fn get_from_cache<'a>(path : &str, cached_images : &CachedImageShared) -> anyhow
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 enum FillStrategy {
     Constant(u8),
     Reflect,
@@ -113,9 +116,83 @@ impl FromStr for FillStrategy {
     }
 }
 
+#[derive(Debug, Copy, Clone)]
+enum MyFilterType {
+    Thumbnail,
+    Resize(fr::ResizeAlg)
+}
 
-fn resize_and_pad(img: DynamicImage, width: u32, height: u32, fill_strategy: &FillStrategy) -> DynamicImage {
-    let resized = img.thumbnail(width, height);
+impl FromStr for MyFilterType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Thumbnail" => Ok(MyFilterType::Thumbnail),
+            "Nearest" => Ok(MyFilterType::Resize(fr::ResizeAlg::Nearest)),
+            "Triangle" => Ok(MyFilterType::Resize(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear))),
+            "CatmullRom" => Ok(MyFilterType::Resize(fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom))),
+            "Gaussian" => Ok(MyFilterType::Resize(fr::ResizeAlg::Convolution(fr::FilterType::Gaussian))),
+            "Box" => Ok(MyFilterType::Resize(fr::ResizeAlg::Convolution(fr::FilterType::Box))),
+            "Hamming" => Ok(MyFilterType::Resize(fr::ResizeAlg::Convolution(fr::FilterType::Hamming))),
+            "Mitchell" => Ok(MyFilterType::Resize(fr::ResizeAlg::Convolution(fr::FilterType::Mitchell))),
+            "Lanczos3" => Ok(MyFilterType::Resize(fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3))),
+            _ => Err(anyhow!("Unknown filter type"))
+        }
+    }
+}
+
+
+#[inline]
+fn get_luma(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32 * 77) + (g as u32 * 150) + (b as u32 * 29)) >> 8
+}
+
+fn to_grayscale(img: DynamicImage) -> DynamicImage {
+    if let DynamicImage::ImageLuma8(_) = img {
+        return img;
+    }
+    let DynamicImage::ImageRgb8(rgb8) = img else {
+        return img.grayscale();
+    };
+    let width = rgb8.width();
+    let height = rgb8.height();
+
+    let src = rgb8.into_raw();
+    let n = src.len() / 3;
+    let mut gray = Vec::with_capacity(n);
+    unsafe { gray.set_len(n) }; // SAFETY: we immediately initialize every element
+    for (i, pixel) in src.chunks_exact(3).enumerate() {
+        let y = get_luma(pixel[0], pixel[1], pixel[2]) as u8;
+        unsafe {
+            *gray.get_unchecked_mut(i) = y;
+        }
+    }
+    DynamicImage::ImageLuma8(GrayImage::from_raw(width, height, gray).expect("Could not create gray image"))
+}
+
+
+fn resize(img: DynamicImage, width: u32, height: u32, filter_type: MyFilterType) -> DynamicImage {
+    let resized = match filter_type {
+        MyFilterType::Thumbnail => img.thumbnail(width, height),
+        MyFilterType::Resize(resize_alg) => {
+            let mut resizer = fr::Resizer::new();
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                resizer.set_cpu_extensions(fr::CpuExtensions::Avx2);
+            }
+            let resize_options = fr::ResizeOptions::new()
+                .resize_alg(resize_alg);
+            let mut resized = DynamicImage::new(width, height, img.color());
+            resizer.resize(&img, &mut resized, &resize_options).expect("Could not resize image");
+            resized
+        }
+    };
+    resized
+}
+
+
+fn resize_and_pad(img: DynamicImage, width: u32, height: u32, fill_strategy: &FillStrategy, filter_type: MyFilterType) -> DynamicImage {
+    let resized = resize(img, width, height, filter_type);
     let mut padded = DynamicImage::new_rgba8(width, height);
     let vertical_pad = resized.height() < height;
 
@@ -201,7 +278,6 @@ fn resize_and_pad(img: DynamicImage, width: u32, height: u32, fill_strategy: &Fi
 }
 
 
-
 fn get_image<S: Write>(stream : &mut S, cached_images : &CachedImageShared, path : &str, width : u32, height : u32) -> anyhow::Result<()> {
     match get_from_cache(path, cached_images)? {
         Some(img_bytes) => {
@@ -213,21 +289,10 @@ fn get_image<S: Write>(stream : &mut S, cached_images : &CachedImageShared, path
     #[cfg(feature = "log")]
     let instant = std::time::Instant::now();
     let raw_img_bytes = if path.starts_with("https://") {
-        match reqwest::blocking::get(path) {
-            Ok(res) => {
-                match res.error_for_status() {
-                    Ok(response) => {
-                       response.bytes().unwrap().to_vec()
-                    }
-                    Err(err) => {
-                        return Err(anyhow!("Error getting : {}", err));
-                    }
-                }
-            }
-            Err(err) => {
-                return Err(anyhow!("Error with path {} getting : {}", path, err));
-            }
-        }
+        reqwest::blocking::get(path)
+            .with_context(|| format!("Error getting with path {}", path))?
+            .error_for_status().context("Error status code")?
+            .bytes().context("Could not get request bytes")?.to_vec()
     } else {
         if !*THREADED_READS.get().ok_or(anyhow!("Not setup"))? {
             // Just get the write guard first, which will prevent any other threads from reading images at the same time
@@ -246,7 +311,13 @@ fn get_image<S: Write>(stream : &mut S, cached_images : &CachedImageShared, path
 
     let mut img = image::load_from_memory(&raw_img_bytes)?;
     if img.width() != width || img.height() != height {
-        img = resize_and_pad(img, width, height, FILL_STRATEGY.get().ok_or(anyhow!("Not setup"))?);
+        let fill_strategy = FILL_STRATEGY.get().context("Not setup")?;
+        let filter_type = FILTER_TYPE.get().context("Not setup")?;
+        let grayscale = GRAYSCALE.get().context("Not setup")?;
+        if *grayscale {
+            img = to_grayscale(img);
+        }
+        img = resize_and_pad(img, width, height, fill_strategy, *filter_type);
     }
     let mut bmp_img = std::io::Cursor::new(Vec::new());
     img.write_to(&mut bmp_img, ImageFormat::Bmp).context("could not convert image to bytes")?;
@@ -312,12 +383,14 @@ fn gets_images(stream: &mut DuplexBytePipeStream, cached_images: &CachedImageSha
 }
 
 
-fn setup(disk_cache_dir: &str, working_dir: &str, threaded_reads: bool, fill_strategy: FillStrategy) -> anyhow::Result<()> {
+fn setup(disk_cache_dir: &str, working_dir: &str, threaded_reads: bool, fill_strategy: FillStrategy, filter_type: MyFilterType, grayscale: bool) -> anyhow::Result<()> {
     std::env::set_current_dir(working_dir)?;
     if CACHE_DIR.get().is_some() {return Ok(());}
     CACHE_DIR.set(disk_cache_dir.to_string()).expect("Can only setup once!");
     THREADED_READS.set(threaded_reads).unwrap();
     FILL_STRATEGY.set(fill_strategy).unwrap();
+    FILTER_TYPE.set(filter_type).unwrap();
+    GRAYSCALE.set(grayscale).unwrap();
     Ok(())
 }
 
@@ -337,10 +410,10 @@ fn clear_cache(cached_images : &CachedImageShared) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn process_command(args : Vec<&str>, stream : &mut DuplexBytePipeStream, cached_images : &CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
+fn process_command(args : &[&str], stream : &mut DuplexBytePipeStream, cached_images : &CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
     match args[0] {
         "clear_cache" => clear_cache(cached_images)?,
-        "setup" => setup(args[1], args[2], args[3] == "true", args[4].parse()?)?,
+        "setup" => setup(args[1], args[2], args[3] == "true", args[4].parse()?, args[5].parse()?, args[6] == "true")?,
         "gets" => gets_images(stream, cached_images, thread_channels, args[1].parse::<u32>().unwrap(), args[2].parse::<u32>().unwrap(), &args[3..])?,
         "get" => {get_image(stream, cached_images, args[1], args[2].parse::<u32>().unwrap(), args[3].parse::<u32>().unwrap())?},
         _ => {println!("No such command : {}", args[0])}
@@ -362,7 +435,7 @@ fn read_command(stream : &mut DuplexBytePipeStream, cached_images : &CachedImage
 
     let command = String::from_utf8_lossy(&data).into_owned();
     let args : Vec<&str> = command.split("|").collect();
-    process_command(args, stream, cached_images, thread_channels)?;
+    process_command(&args, stream, cached_images, thread_channels)?;
     Ok(())
 }
 

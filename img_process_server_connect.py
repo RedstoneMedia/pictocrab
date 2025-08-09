@@ -72,10 +72,12 @@ def write_msg(handle, data):
 
 class ImageProcessServerConnect:
 
-    def __init__(self, cache_dir: str, threaded_reads: bool, working_dir = "./", fill_strategy = "reflect"):
-        subprocess.Popen(["picto-crab.exe"])
+    def __init__(self, cache_dir: str, threaded_reads: bool, working_dir = "./", fill_strategy = "reflect", filter_type = "Lanczos3", grayscale = False):
+        subprocess.Popen(["picto-crab"])
         self.handle = connect_to_pipe(SERVER_PIPE_NAME)
-        self.send_command("setup", [cache_dir, working_dir, str(threaded_reads).lower(), fill_strategy])
+        self.working_dir = working_dir
+        self.grayscale = grayscale
+        self.send_command("setup", [cache_dir, working_dir, str(threaded_reads).lower(), fill_strategy, filter_type, str(grayscale).lower()])
         self.current_command = None
 
     def send_command(self, command_type : str, args : list):
@@ -88,7 +90,7 @@ class ImageProcessServerConnect:
         self.send_command("gets", [width, height] + paths)
         for _ in paths:
             data = read_msg(self.handle, READ_BUFFER_SIZE)
-            image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_GRAYSCALE if self.grayscale else cv2.IMREAD_COLOR)
             output_images.append(image)
         self.current_command = None
 
@@ -139,4 +141,4 @@ def benchmark(imgs_path: str):
 
 
 if __name__ == "__main__":
-    benchmark("<Some path here>")
+    #benchmark("<Some path here>")
