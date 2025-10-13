@@ -1,13 +1,13 @@
 use std::io::{Read, Write};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, mpsc};
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use fast_image_resize as fr;
-use interprocess::os::windows::named_pipe::{PipeListener, DuplexBytePipeStream, PipeListenerOptions, PipeMode};
 use image::{ImageFormat, GenericImageView, EncodableLayout, DynamicImage, GenericImage, GrayImage};
+use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, ToNsName};
+use interprocess::local_socket::traits::ListenerExt;
 use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 use once_cell::sync::OnceCell;
 use mimalloc::MiMalloc;
@@ -17,7 +17,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const GETS_THREAD_COUNT: usize = 12;
 const BUFFER_SIZE: usize = 4096;
-const PIPE_NAME: &str = "img_process_server";
+const PIPE_NAME: &str = "img_process_server.sock";
 const MIN_AVAILABLE_MEMORY : u64 = 6;
 
 static CACHE_DIR : OnceCell<String> = OnceCell::new();
@@ -341,7 +341,7 @@ fn gets_thread(cached_images: CachedImageShared, receiver: mpsc::Receiver<(u32, 
     }
 }
 
-fn gets_images(stream: &mut DuplexBytePipeStream, cached_images: &CachedImageShared, thread_channels: &ThreadChannels, width: u32, height: u32, paths: &[&str]) -> anyhow::Result<()> {
+fn gets_images(stream: &mut Stream, cached_images: &CachedImageShared, thread_channels: &ThreadChannels, width: u32, height: u32, paths: &[&str]) -> anyhow::Result<()> {
     let unlocked_cache = cached_images.read().expect("Cannot read from cache");
     let paths_key = paths.join("");
     #[cfg(feature = "log")]
@@ -410,7 +410,7 @@ fn clear_cache(cached_images : &CachedImageShared) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn process_command(args : &[&str], stream : &mut DuplexBytePipeStream, cached_images : &CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
+fn process_command(args : &[&str], stream : &mut Stream, cached_images : &CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
     match args[0] {
         "clear_cache" => clear_cache(cached_images)?,
         "setup" => setup(args[1], args[2], args[3] == "true", args[4].parse()?, args[5].parse()?, args[6] == "true")?,
@@ -422,9 +422,11 @@ fn process_command(args : &[&str], stream : &mut DuplexBytePipeStream, cached_im
 }
 
 
-fn read_command(stream : &mut DuplexBytePipeStream, cached_images : &CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
+fn read_command(stream : &mut Stream, cached_images : &CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
     let mut read_size_buffer = [0u8; 4];
-    if stream.read(&mut read_size_buffer)? == 0 {return Ok(())};
+    if stream.read(&mut read_size_buffer)? == 0 {
+        bail!("EOF");
+    };
     let msg_size = u32::from_be_bytes(read_size_buffer);
     let mut data = Vec::with_capacity(BUFFER_SIZE);
     let mut buff = [0u8;BUFFER_SIZE];
@@ -440,7 +442,7 @@ fn read_command(stream : &mut DuplexBytePipeStream, cached_images : &CachedImage
 }
 
 
-fn read_loop(mut stream: DuplexBytePipeStream, cached_images: CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
+fn read_loop(mut stream: Stream, cached_images: CachedImageShared, thread_channels: &ThreadChannels) -> anyhow::Result<()> {
     loop {
         read_command(&mut stream, &cached_images, thread_channels)?
     }
@@ -448,10 +450,10 @@ fn read_loop(mut stream: DuplexBytePipeStream, cached_images: CachedImageShared,
 
 
 fn main() {
-    let listener : PipeListener<DuplexBytePipeStream> = PipeListenerOptions::new()
-        .name(OsStr::new(PIPE_NAME))
-        .mode(PipeMode::Messages)
-        .create()
+    let name = PIPE_NAME.to_ns_name::<GenericNamespaced>().expect("Should create name");
+    let opts = ListenerOptions::new().name(name);
+
+    let listener = opts.create_sync()
         .expect("Could not create pipe listener");
 
     let data = HashMap::with_capacity(300000);
@@ -473,10 +475,9 @@ fn main() {
     println!("[PictoCrab] Waiting for connection");
     for stream in listener.incoming() {
         let Ok(stream) = stream else {continue};
-        let process_id = stream.client_process_id().unwrap();
-        println!("[PictoCrab] Connected to process {:?}", process_id);
+        println!("[PictoCrab] Connected");
         if let Err(e) = read_loop(stream, cached_images.clone(), &thread_channels) {
-            println!("[PictoCrab] Error with client {:?}: {:?}", process_id, e)
+            println!("[PictoCrab] Error: {:?}", e)
         }
     }
 }
