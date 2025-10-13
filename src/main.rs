@@ -159,11 +159,11 @@ fn to_grayscale(img: DynamicImage) -> DynamicImage {
 
     let src = rgb8.into_raw();
     let n = src.len() / 3;
-    let mut gray = Vec::with_capacity(n);
-    unsafe { gray.set_len(n) }; // SAFETY: we immediately initialize every element
+    let mut gray = vec![0u8; n];
     for (i, pixel) in src.chunks_exact(3).enumerate() {
         let y = get_luma(pixel[0], pixel[1], pixel[2]) as u8;
         unsafe {
+            // SAFETY: gray is allocated with length n
             *gray.get_unchecked_mut(i) = y;
         }
     }
