@@ -14,7 +14,7 @@ if os.name == "nt":
 
 
 SERVER_PIPE_NAME = "img_process_server.sock"
-READ_BUFFER_SIZE = 4069
+READ_BUFFER_SIZE = 8192
 READ_TIMEOUT = 60
 MAX_RETRY = 3
 
@@ -115,7 +115,7 @@ class CrossPlatformConnection:
 class ImageProcessServerConnect:
 
     def __init__(self, cache_dir: str, threaded_reads: bool, working_dir = "./", fill_strategy = "reflect", filter_type = "Lanczos3", grayscale = False):
-        subprocess.Popen(["picto-crab"]) # Needs to be in path
+        #subprocess.Popen(["picto-crab"]) # Needs to be in path
         self.conn = CrossPlatformConnection(SERVER_PIPE_NAME)
         self.conn.connect()
         self.working_dir = working_dir
@@ -197,4 +197,6 @@ def benchmark(imgs_path: str):
 
 
 if __name__ == "__main__":
-    #benchmark("<Some path here>")
+    server = ImageProcessServerConnect("image_cache", False)
+    cv2.imshow("a", server.ask_for_images(["/home/mmustermann/Pictures/monte_pharaone.png"], 224, 224)[0])
+    cv2.waitKey()
